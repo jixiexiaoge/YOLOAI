@@ -1,4 +1,4 @@
-package com.example.carrotamap.webrtc
+package com.example.yoloai.webrtc
 
 import android.content.Context
 import android.util.Log

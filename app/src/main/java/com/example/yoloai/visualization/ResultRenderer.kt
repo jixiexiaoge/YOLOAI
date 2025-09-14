@@ -22,11 +22,11 @@ class ResultRenderer {
     companion object {
         private const val TAG = "ResultRenderer"
         
-        // 颜色定义 - 按照demo.py的效果
-        private val VEHICLE_COLOR = Color.MAGENTA      // 车辆框用紫色 (BGR: 255,0,255)
-        private val SOLID_LANE_COLOR = Color.RED       // 实线用红色 (BGR: 0,0,255)
+        // 颜色定义 - 严格按照demo copy.py的BGR格式
+        private val VEHICLE_COLOR = Color.RED          // 车辆框保持红色
+        private val SOLID_LANE_COLOR = Color.BLUE      // 实线用蓝色 (BGR: 255,0,0)
         private val DASHED_LANE_COLOR = Color.YELLOW   // 虚线用黄色 (BGR: 0,255,255)
-        private val DRIVABLE_AREA_COLOR = Color.GREEN  // 可行驶区域用绿色 (BGR: 0,255,0)
+        private val DRIVABLE_AREA_COLOR = Color.argb(128, 0, 255, 0) // 半透明绿色 (BGR: 0,255,0, alpha=0.5)
         private val TEXT_COLOR = Color.WHITE
         private val TEXT_BACKGROUND_COLOR = Color.argb(150, 0, 0, 0)
         
@@ -164,11 +164,11 @@ class ResultRenderer {
                     val pixelWidth = maxOf(1f, scaleX)
                     val pixelHeight = maxOf(1f, scaleY)
                     
-                    // 根据像素值设置不同颜色
+                    // 根据像素值设置不同颜色 - 严格按照demo copy.py
                     when (pixelValue) {
-                        1 -> paint.color = Color.RED        // 实线用红色
-                        2 -> paint.color = Color.CYAN       // 虚线用淡蓝色
-                        else -> paint.color = Color.RED     // 默认红色
+                        1 -> paint.color = Color.BLUE       // 实线用蓝色 (BGR: 255,0,0)
+                        2 -> paint.color = Color.YELLOW     // 虚线用黄色 (BGR: 0,255,255)
+                        else -> paint.color = Color.BLUE    // 默认蓝色
                     }
                     
                     canvas.drawRect(
@@ -252,14 +252,14 @@ class ResultRenderer {
         )
         canvas.drawRect(legendBackground, backgroundPaint)
         
-        // 绘制图例文字
-        canvas.drawText("Red: Solid Lines", x, y, legendPaint)
+        // 绘制图例文字 - 严格按照demo copy.py
+        canvas.drawText("Blue: Solid Lines", x, y, legendPaint)
         y += 25f
-        canvas.drawText("Cyan: Dashed Lines", x, y, legendPaint)
+        canvas.drawText("Yellow: Dashed Lines", x, y, legendPaint)
         y += 25f
         canvas.drawText("Green: Drivable Area", x, y, legendPaint)
         y += 25f
-        canvas.drawText("Purple: Vehicle", x, y, legendPaint)
+        canvas.drawText("Red: Vehicle", x, y, legendPaint)
         
         // 绘制FPS信息
         y += 40f

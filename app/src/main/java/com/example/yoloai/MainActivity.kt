@@ -201,9 +201,11 @@ class MainActivity : ComponentActivity() {
                 
                 // 强制在主线程更新UI状态，确保UI更新
                 runOnUiThread {
+                    // 关键：回收旧的Bitmap以释放内存，避免内存泄漏和卡顿
+                    _processedBitmapState.value?.recycle()
                     _processedBitmapState.value = renderedBitmap
-                    _uiUpdateTriggerState.value = ++uiUpdateTrigger
-                    Log.d(TAG, "UI状态已更新 - 触发次数: $uiUpdateTrigger")
+                    _uiUpdateTriggerState.value = _uiUpdateTriggerState.value + 1 // 递增以触发Compose重新组合
+                    Log.d(TAG, "UI状态已更新 - 触发次数: ${_uiUpdateTriggerState.value}")
                 }
                 
                 Log.d(TAG, "处理完成 - FPS: ${result.fps}, 检测数量: ${result.detections.size}")
@@ -219,6 +221,7 @@ class MainActivity : ComponentActivity() {
     private fun setPreviewView(previewView: PreviewView) {
         this.previewView = previewView
     }
+    
     
     override fun onDestroy() {
         super.onDestroy()
@@ -248,6 +251,7 @@ fun YOLOPApp(
             style = MaterialTheme.typography.headlineMedium,
             modifier = Modifier.padding(16.dp)
         )
+        
         
         // 主摄像头预览区域（上半部分）
         Box(

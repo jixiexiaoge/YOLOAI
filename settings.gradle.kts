@@ -16,6 +16,10 @@ dependencyResolutionManagement {
     repositories {
         google()
         mavenCentral()
+        // 添加JitPack仓库用于WebRTC
+        maven { url = uri("https://jitpack.io") }
+        // 添加Sonatype仓库
+        maven { url = uri("https://oss.sonatype.org/content/repositories/snapshots/") }
     }
 }
 
