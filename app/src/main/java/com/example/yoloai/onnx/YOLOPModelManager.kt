@@ -30,8 +30,23 @@ class YOLOPModelManager(private val context: Context) {
         private const val TAG = "YOLOPModelManager"
         private const val MODEL_NAME = "yolop-320-320.onnx"
         private const val INPUT_SIZE = 320
-        private const val CONFIDENCE_THRESHOLD = 0.25f
+        
+        // 支持多种分辨率优化
+        enum class InputResolution(val size: Int, val description: String) {
+            RESOLUTION_256(256, "256x256 - 最高性能"),
+            RESOLUTION_288(288, "288x288 - 平衡性能"),
+            RESOLUTION_320(320, "320x320 - 原始精度")
+        }
+        
+        // 当前使用的分辨率，可以根据性能需求调整
+        // 注意：由于模型文件是320x320固定版本，暂时只能使用320分辨率
+        private var currentResolution = InputResolution.RESOLUTION_320
+        private const val CONFIDENCE_THRESHOLD = 0.05f // 进一步降低置信度阈值，提高检测敏感度
         private const val IOU_THRESHOLD = 0.45f
+        
+        // 性能优化参数
+        private const val ENABLE_DETAILED_SEGMENTATION = false // 暂时禁用详细分割处理
+        private const val SEGMENTATION_SAMPLE_RATE = 4 // 每4个像素采样一次，减少计算量
         
         // YOLOP模型输入输出层名称（根据export_onnx.py）
         private const val INPUT_NAME = "images"
@@ -138,7 +153,7 @@ class YOLOPModelManager(private val context: Context) {
     }
     
     /**
-     * 加载ONNX模型
+     * 加载ONNX模型 - 智能配置和回退机制
      */
     private fun loadONNXModel(): Boolean {
         return try {
@@ -147,8 +162,138 @@ class YOLOPModelManager(private val context: Context) {
                 return false
             }
             
+            // 尝试多种配置策略
+            val configurations = listOf(
+                createNNAPIConfig(),
+                createOptimizedCPUConfig(),
+                createBasicCPUConfig()
+            )
+            
+            for ((index, config) in configurations.withIndex()) {
+                try {
+                    Log.i(TAG, "尝试配置 ${index + 1}: ${config.description}")
+                    onnxSession = onnxEnvironment!!.createSession(modelPath!!, config.options)
+                    Log.i(TAG, "模型加载成功: ${config.description}")
+                    return true
+                } catch (e: Exception) {
+                    Log.w(TAG, "配置 ${index + 1} 失败: ${e.message}")
+                    if (index == configurations.size - 1) {
+                        Log.e(TAG, "所有配置都失败，模型加载失败")
+                        throw e
+                    }
+                }
+            }
+            
+            false
+        } catch (e: Exception) {
+            Log.e(TAG, "ONNX模型加载失败: ${e.message}", e)
+            false
+        }
+    }
+    
+    /**
+     * 创建NNAPI配置
+     */
+    private fun createNNAPIConfig(): ConfigResult {
+        val sessionOptions = OrtSession.SessionOptions()
+        sessionOptions.setOptimizationLevel(OrtSession.SessionOptions.OptLevel.ALL_OPT)
+        
+        try {
+            sessionOptions.addNnapi()
+            sessionOptions.setExecutionMode(OrtSession.SessionOptions.ExecutionMode.PARALLEL)
+            sessionOptions.setInterOpNumThreads(4)
+            sessionOptions.setIntraOpNumThreads(4)
+            sessionOptions.setMemoryPatternOptimization(true)
+            return ConfigResult(sessionOptions, "NNAPI硬件加速配置")
+        } catch (e: Exception) {
+            throw Exception("NNAPI配置失败: ${e.message}")
+        }
+    }
+    
+    /**
+     * 创建优化的CPU配置
+     */
+    private fun createOptimizedCPUConfig(): ConfigResult {
+        val sessionOptions = OrtSession.SessionOptions()
+        sessionOptions.setOptimizationLevel(OrtSession.SessionOptions.OptLevel.ALL_OPT)
+        sessionOptions.setExecutionMode(OrtSession.SessionOptions.ExecutionMode.PARALLEL)
+        sessionOptions.setInterOpNumThreads(6) // 增加线程数
+        sessionOptions.setIntraOpNumThreads(6) // 增加线程数
+        try {
+            sessionOptions.setMemoryPatternOptimization(true)
+        } catch (e: Exception) {
+            Log.w(TAG, "内存优化不可用")
+        }
+        return ConfigResult(sessionOptions, "高度优化CPU配置")
+    }
+    
+    /**
+     * 创建基础CPU配置
+     */
+    private fun createBasicCPUConfig(): ConfigResult {
+        val sessionOptions = OrtSession.SessionOptions()
+        sessionOptions.setOptimizationLevel(OrtSession.SessionOptions.OptLevel.BASIC_OPT)
+        sessionOptions.setExecutionMode(OrtSession.SessionOptions.ExecutionMode.SEQUENTIAL)
+        sessionOptions.setInterOpNumThreads(1)
+        sessionOptions.setIntraOpNumThreads(1)
+        return ConfigResult(sessionOptions, "基础CPU配置")
+    }
+    
+    /**
+     * 配置结果数据类
+     */
+    private data class ConfigResult(
+        val options: OrtSession.SessionOptions,
+        val description: String
+    )
+    
+    /**
+     * 加载ONNX模型 - 原始方法（已废弃）
+     */
+    private fun loadONNXModelOld(): Boolean {
+        return try {
+            if (onnxEnvironment == null || modelPath == null) {
+                Log.e(TAG, "ONNX环境或模型路径为空")
+                return false
+            }
+            
             val sessionOptions = OrtSession.SessionOptions()
             sessionOptions.setOptimizationLevel(OrtSession.SessionOptions.OptLevel.ALL_OPT)
+            
+            // 智能启用NNAPI硬件加速 - 包含回退机制
+            var nnapiEnabled = false
+            try {
+                // 尝试启用NNAPI
+                sessionOptions.addNnapi()
+                nnapiEnabled = true
+                Log.i(TAG, "NNAPI硬件加速已启用")
+            } catch (e: Exception) {
+                Log.w(TAG, "NNAPI不可用，使用CPU推理: ${e.message}")
+                // 如果NNAPI失败，继续使用CPU推理
+            }
+            
+            // 根据NNAPI状态优化配置
+            if (nnapiEnabled) {
+                // NNAPI模式下使用优化配置
+                sessionOptions.setExecutionMode(OrtSession.SessionOptions.ExecutionMode.PARALLEL)
+                sessionOptions.setInterOpNumThreads(4) // NNAPI可以使用更多线程
+                sessionOptions.setIntraOpNumThreads(4)
+                Log.i(TAG, "使用NNAPI优化配置：并行执行，4线程")
+            } else {
+                // CPU模式下使用保守配置
+                sessionOptions.setExecutionMode(OrtSession.SessionOptions.ExecutionMode.SEQUENTIAL)
+                sessionOptions.setInterOpNumThreads(2) // CPU模式使用较少线程
+                sessionOptions.setIntraOpNumThreads(2)
+                Log.i(TAG, "使用CPU保守配置：顺序执行，2线程")
+            }
+            
+            // 启用内存优化
+            try {
+                sessionOptions.setMemoryPatternOptimization(true)
+                Log.i(TAG, "内存模式优化已启用")
+            } catch (e: Exception) {
+                Log.w(TAG, "内存模式优化不可用: ${e.message}")
+            }
             
             onnxSession = onnxEnvironment!!.createSession(modelPath!!, sessionOptions)
             
@@ -166,8 +311,13 @@ class YOLOPModelManager(private val context: Context) {
         }
     }
     
+    // 性能监控变量
+    private var totalInferenceTime = 0L
+    private var inferenceCount = 0
+    private var lastPerformanceLogTime = System.currentTimeMillis()
+    
     /**
-     * 执行推理 - 真实的AI推理
+     * 执行推理 - 优化的AI推理
      * @param bitmap 输入图像
      * @return 推理结果
      */
@@ -181,35 +331,55 @@ class YOLOPModelManager(private val context: Context) {
             val startTime = System.currentTimeMillis()
             
             // 1. 预处理图像
+            val preprocessStart = System.currentTimeMillis()
             val inputTensor = preprocessImage(bitmap)
             if (inputTensor == null) {
                 Log.e(TAG, "图像预处理失败")
                 return@withContext null
             }
+            val preprocessTime = System.currentTimeMillis() - preprocessStart
             
             // 2. 执行模型推理
+            val inferenceStart = System.currentTimeMillis()
             val outputs = runInference(inputTensor)
             if (outputs == null) {
                 Log.e(TAG, "模型推理失败")
                 return@withContext null
             }
+            val inferenceTime = System.currentTimeMillis() - inferenceStart
             
             // 3. 后处理结果
+            val postprocessStart = System.currentTimeMillis()
             val detections = postprocessDetections(outputs.detectionOutput, bitmap.width, bitmap.height)
             val daSegMask = postprocessSegmentation(outputs.daSegOutput)
             val llSegMask = postprocessLaneLineSegmentation(outputs.llSegOutput)
+            val postprocessTime = System.currentTimeMillis() - postprocessStart
             
-            val inferenceTime = System.currentTimeMillis() - startTime
+            val totalTime = System.currentTimeMillis() - startTime
+            
+            // 性能统计
+            totalInferenceTime += totalTime
+            inferenceCount++
+            
+            // 每10次推理输出一次性能统计
+            if (inferenceCount % 10 == 0) {
+                val avgTime = totalInferenceTime / inferenceCount
+                val currentTime = System.currentTimeMillis()
+                if (currentTime - lastPerformanceLogTime > 5000) { // 每5秒输出一次
+                    Log.i(TAG, "性能统计 - 平均推理时间: ${avgTime}ms, 平均FPS: ${String.format("%.1f", 1000.0f / avgTime)}, 总推理次数: $inferenceCount")
+                    lastPerformanceLogTime = currentTime
+                }
+            }
             
             val result = YOLOPResult(
                 detections = detections,
                 daSegMask = daSegMask,
                 llSegMask = llSegMask,
-                inferenceTime = inferenceTime,
-                fps = 1000.0f / inferenceTime
+                inferenceTime = totalTime,
+                fps = 1000.0f / totalTime
             )
             
-            Log.d(TAG, "推理完成，耗时: ${inferenceTime}ms，检测数量: ${detections.size}")
+            Log.d(TAG, "推理完成 - 总时间: ${totalTime}ms (预处理: ${preprocessTime}ms, 推理: ${inferenceTime}ms, 后处理: ${postprocessTime}ms), 检测数量: ${detections.size}")
             result
             
         } catch (e: Exception) {
@@ -218,13 +388,19 @@ class YOLOPModelManager(private val context: Context) {
         }
     }
     
+    // 预分配的缓冲区，避免重复内存分配
+    private var preprocessBuffer: FloatBuffer? = null
+    private var outputBuffers: MutableMap<String, FloatArray> = mutableMapOf()
+    private var inputTensor: OnnxTensor? = null
+    
     /**
-     * 预处理图像 - 将Bitmap转换为模型输入格式
+     * 预处理图像 - 将Bitmap转换为模型输入格式（优化版本）
      */
     private fun preprocessImage(bitmap: Bitmap): FloatBuffer? {
         return try {
-            // 1. 调整图像大小到320x320
-            val resizedBitmap = Bitmap.createScaledBitmap(bitmap, INPUT_SIZE, INPUT_SIZE, true)
+            // 1. 调整图像大小到当前分辨率
+            val targetSize = currentResolution.size
+            val resizedBitmap = Bitmap.createScaledBitmap(bitmap, targetSize, targetSize, true)
             
             // 2. 转换为RGB格式
             val rgbBitmap = if (resizedBitmap.config == Bitmap.Config.ARGB_8888) {
@@ -234,18 +410,21 @@ class YOLOPModelManager(private val context: Context) {
             }
             
             // 3. 归一化到[0,1]范围并转换为CHW格式
-            val normalizedData = normalizeImage(rgbBitmap)
+            val normalizedData = normalizeImageOptimized(rgbBitmap)
             
-            // 4. 转换为FloatBuffer
-            val floatBuffer = ByteBuffer.allocateDirect(normalizedData.size * 4)
-                .order(ByteOrder.nativeOrder())
-                .asFloatBuffer()
+            // 4. 使用预分配的缓冲区，避免重复内存分配
+            if (preprocessBuffer == null) {
+                preprocessBuffer = ByteBuffer.allocateDirect(normalizedData.size * 4)
+                    .order(ByteOrder.nativeOrder())
+                    .asFloatBuffer()
+            }
             
-            floatBuffer.put(normalizedData)
-            floatBuffer.rewind()
+            preprocessBuffer!!.rewind()
+            preprocessBuffer!!.put(normalizedData)
+            preprocessBuffer!!.rewind()
             
             Log.d(TAG, "图像预处理完成，尺寸: ${rgbBitmap.width}x${rgbBitmap.height}")
-            floatBuffer
+            preprocessBuffer
             
         } catch (e: Exception) {
             Log.e(TAG, "图像预处理失败: ${e.message}", e)
@@ -254,26 +433,24 @@ class YOLOPModelManager(private val context: Context) {
     }
     
     /**
-     * 归一化图像数据并转换为CHW格式
+     * 归一化图像数据并转换为CHW格式（优化版本）
      */
-    private fun normalizeImage(bitmap: Bitmap): FloatArray {
+    private fun normalizeImageOptimized(bitmap: Bitmap): FloatArray {
         val width = bitmap.width
         val height = bitmap.height
         val pixels = IntArray(width * height)
         bitmap.getPixels(pixels, 0, width, 0, 0, width, height)
         
         val normalizedData = FloatArray(width * height * 3)
+        val wh = width * height
         
+        // 使用索引计算优化循环
         for (i in pixels.indices) {
             val pixel = pixels[i]
-            val r = ((pixel shr 16) and 0xFF) / 255.0f
-            val g = ((pixel shr 8) and 0xFF) / 255.0f
-            val b = (pixel and 0xFF) / 255.0f
-            
-            // YOLOP模型期望的输入格式是CHW (Channel-Height-Width)
-            normalizedData[i] = r
-            normalizedData[width * height + i] = g
-            normalizedData[2 * width * height + i] = b
+            // 使用位运算提取RGB值并归一化
+            normalizedData[i] = ((pixel shr 16) and 0xFF) / 255.0f
+            normalizedData[wh + i] = ((pixel shr 8) and 0xFF) / 255.0f
+            normalizedData[2 * wh + i] = (pixel and 0xFF) / 255.0f
         }
         
         return normalizedData
@@ -291,8 +468,11 @@ class YOLOPModelManager(private val context: Context) {
             
             Log.d(TAG, "执行真实的ONNX模型推理")
             
-            // 创建输入张量
-            val inputShape = longArrayOf(1, 3, INPUT_SIZE.toLong(), INPUT_SIZE.toLong())
+            // 创建输入张量 - 使用动态分辨率，复用预分配的tensor
+            val targetSize = currentResolution.size
+            val inputShape = longArrayOf(1, 3, targetSize.toLong(), targetSize.toLong())
+            
+            // 创建输入张量 - 简化版本，避免复杂的tensor复用
             val inputOnnxTensor = OnnxTensor.createTensor(onnxEnvironment!!, inputTensor, inputShape)
             
             // 准备输入映射
@@ -311,6 +491,8 @@ class YOLOPModelManager(private val context: Context) {
             
             if (!detectionOptional.isPresent || !daSegOptional.isPresent || !llSegOptional.isPresent) {
                 Log.e(TAG, "输出张量不存在")
+                inputOnnxTensor.close()
+                results.close()
                 return null
             }
             
@@ -318,23 +500,44 @@ class YOLOPModelManager(private val context: Context) {
             val daSegTensor = daSegOptional.get() as OnnxTensor
             val llSegTensor = llSegOptional.get() as OnnxTensor
             
-            val detectionOutput = detectionTensor.floatBuffer.array()
-            val daSegOutput = daSegTensor.floatBuffer.array()
-            val llSegOutput = llSegTensor.floatBuffer.array()
+            // 直接使用缓冲区而不是复制到数组
+            val detectionOutput = detectionTensor.floatBuffer
+            val daSegOutput = daSegTensor.floatBuffer
+            val llSegOutput = llSegTensor.floatBuffer
+            
+            // 创建输出数组
+            val detectionArray = FloatArray(detectionOutput.remaining())
+            val daSegArray = FloatArray(daSegOutput.remaining())
+            val llSegArray = FloatArray(llSegOutput.remaining())
+            
+            // 保存当前位置
+            val detectionPos = detectionOutput.position()
+            val daSegPos = daSegOutput.position()
+            val llSegPos = llSegOutput.position()
+            
+            // 获取数据
+            detectionOutput.get(detectionArray)
+            daSegOutput.get(daSegArray)
+            llSegOutput.get(llSegArray)
+            
+            // 恢复位置
+            detectionOutput.position(detectionPos)
+            daSegOutput.position(daSegPos)
+            llSegOutput.position(llSegPos)
             
             // 清理资源
             inputOnnxTensor.close()
             results.close()
             
             Log.d(TAG, "ONNX推理完成")
-            Log.d(TAG, "检测输出形状: ${detectionOutput.size}")
-            Log.d(TAG, "可行驶区域输出形状: ${daSegOutput.size}")
-            Log.d(TAG, "车道线输出形状: ${llSegOutput.size}")
+            Log.d(TAG, "检测输出形状: ${detectionArray.size}")
+            Log.d(TAG, "可行驶区域输出形状: ${daSegArray.size}")
+            Log.d(TAG, "车道线输出形状: ${llSegArray.size}")
             
             ModelOutputs(
-                detectionOutput = detectionOutput,
-                daSegOutput = daSegOutput,
-                llSegOutput = llSegOutput
+                detectionOutput = detectionArray,
+                daSegOutput = daSegArray,
+                llSegOutput = llSegArray
             )
             
         } catch (e: Exception) {
@@ -393,7 +596,7 @@ class YOLOPModelManager(private val context: Context) {
             }
             
             // 应用NMS
-            detections.addAll(applyNMS(candidates))
+            detections.addAll(applyNMSOptimized(candidates))
             
             Log.d(TAG, "检测到 ${candidates.size} 个候选框，NMS后剩余 ${detections.size} 个")
             
@@ -405,9 +608,9 @@ class YOLOPModelManager(private val context: Context) {
     }
     
     /**
-     * 应用非极大值抑制（NMS）
+     * 应用非极大值抑制（NMS）- 优化版本
      */
-    private fun applyNMS(candidates: List<Detection>): List<Detection> {
+    private fun applyNMSOptimized(candidates: List<Detection>): List<Detection> {
         if (candidates.isEmpty()) return emptyList()
         
         // 按置信度排序
@@ -420,11 +623,22 @@ class YOLOPModelManager(private val context: Context) {
             
             selected.add(sortedCandidates[i])
             
+            // 优化：提前退出条件
+            val current = sortedCandidates[i]
+            
             // 抑制与当前检测框重叠度高的其他检测框
             for (j in i + 1 until sortedCandidates.size) {
                 if (suppressed[j]) continue
                 
-                val iou = calculateIoU(sortedCandidates[i], sortedCandidates[j])
+                val other = sortedCandidates[j]
+                
+                // 优化：快速排斥测试
+                if (current.x2 < other.x1 || other.x2 < current.x1 ||
+                    current.y2 < other.y1 || other.y2 < current.y1) {
+                    continue
+                }
+                
+                val iou = calculateIoU(current, other)
                 if (iou > IOU_THRESHOLD) {
                     suppressed[j] = true
                 }
@@ -465,20 +679,47 @@ class YOLOPModelManager(private val context: Context) {
             
             val mask = Array(height) { IntArray(width) }
             
-            // 处理分割输出 - 使用torch.max()的逻辑
-            for (y in 0 until height) {
-                for (x in 0 until width) {
-                    val backgroundIndex = y * width + x
-                    val foregroundIndex = height * width + y * width + x
-                    
-                    val backgroundProb = segOutput[backgroundIndex]
-                    val foregroundProb = segOutput[foregroundIndex]
-                    
-                    // 使用argmax逻辑：选择概率最大的类别
-                    if (foregroundProb > backgroundProb) {
-                        mask[y][x] = 1  // 前景
-                    } else {
-                        mask[y][x] = 0  // 背景
+            // 处理分割输出 - 优化版本
+            if (ENABLE_DETAILED_SEGMENTATION) {
+                // 详细处理模式
+                for (y in 0 until height) {
+                    for (x in 0 until width) {
+                        val backgroundIndex = y * width + x
+                        val foregroundIndex = height * width + y * width + x
+                        
+                        val backgroundProb = segOutput[backgroundIndex]
+                        val foregroundProb = segOutput[foregroundIndex]
+                        
+                        // 使用argmax逻辑：选择概率最大的类别
+                        if (foregroundProb > backgroundProb) {
+                            mask[y][x] = 1  // 前景
+                        } else {
+                            mask[y][x] = 0  // 背景
+                        }
+                    }
+                }
+            } else {
+                // 快速处理模式 - 采样处理，减少计算量
+                for (y in 0 until height step SEGMENTATION_SAMPLE_RATE) {
+                    for (x in 0 until width step SEGMENTATION_SAMPLE_RATE) {
+                        val backgroundIndex = y * width + x
+                        val foregroundIndex = height * width + y * width + x
+                        
+                        val backgroundProb = segOutput[backgroundIndex]
+                        val foregroundProb = segOutput[foregroundIndex]
+                        
+                        val value = if (foregroundProb > backgroundProb) 1 else 0
+                        
+                        // 填充周围像素
+                        for (dy in 0 until SEGMENTATION_SAMPLE_RATE) {
+                            for (dx in 0 until SEGMENTATION_SAMPLE_RATE) {
+                                val ny = y + dy
+                                val nx = x + dx
+                                if (ny < height && nx < width) {
+                                    mask[ny][nx] = value
+                                }
+                            }
+                        }
                     }
                 }
             }
@@ -830,6 +1071,26 @@ class YOLOPModelManager(private val context: Context) {
             else -> "unknown"
         }
     }
+    
+    /**
+     * 设置输入分辨率
+     * @param resolution 新的分辨率设置
+     */
+    fun setInputResolution(resolution: Companion.InputResolution) {
+        // 安全检查：当前模型只支持320x320
+        if (resolution != Companion.InputResolution.RESOLUTION_320) {
+            Log.w(TAG, "当前模型只支持320x320分辨率，自动调整为320x320")
+            currentResolution = Companion.InputResolution.RESOLUTION_320
+        } else {
+            currentResolution = resolution
+        }
+        Log.i(TAG, "输入分辨率已设置为: ${currentResolution.description}")
+    }
+    
+    /**
+     * 获取当前分辨率
+     */
+    fun getCurrentResolution(): Companion.InputResolution = currentResolution
     
     /**
      * 释放资源

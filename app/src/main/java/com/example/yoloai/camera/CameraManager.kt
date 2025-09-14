@@ -65,7 +65,8 @@ class CameraManager(
             // 配置图像分析 - 使用320x320分辨率用于AI处理
             imageAnalyzer = ImageAnalysis.Builder()
                 .setTargetResolution(Size(320, 320)) // 使用320x320分辨率用于AI处理
-                .setBackpressureStrategy(ImageAnalysis.STRATEGY_KEEP_ONLY_LATEST)
+                .setBackpressureStrategy(ImageAnalysis.STRATEGY_KEEP_ONLY_LATEST) // 只保留最新帧
+                .setOutputImageFormat(ImageAnalysis.OUTPUT_IMAGE_FORMAT_YUV_420_888) // 使用YUV格式提高性能
                 .build()
                 .also { analyzer ->
                     analyzer.setAnalyzer(
@@ -247,7 +248,7 @@ private class YOLOPImageAnalyzer(
             // 使用更高效的转换方法
             val yuvImage = YuvImage(nv21, ImageFormat.NV21, width, height, null)
             val out = ByteArrayOutputStream()
-            yuvImage.compressToJpeg(Rect(0, 0, width, height), 80, out) // 降低质量以减少处理时间
+            yuvImage.compressToJpeg(Rect(0, 0, width, height), 60, out) // 进一步降低质量以提高速度
             val imageBytes = out.toByteArray()
             
             // 将字节数组转换为Bitmap

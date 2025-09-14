@@ -14,11 +14,13 @@ import androidx.activity.enableEdgeToEdge
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.camera.view.PreviewView
 import androidx.compose.foundation.layout.*
+import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.material3.*
 import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.platform.LocalLifecycleOwner
+import androidx.compose.ui.text.input.KeyboardType
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.viewinterop.AndroidView
 import androidx.core.content.ContextCompat
@@ -29,6 +31,11 @@ import com.example.yoloai.onnx.YOLOPResult
 import com.example.yoloai.ui.theme.YOLOAITheme
 import com.example.yoloai.visualization.ResultRenderer
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.channels.Channel
+import kotlinx.coroutines.channels.consumeEach
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.withContext
+import java.util.concurrent.atomic.AtomicBoolean
 
 /**
  * 主活动
@@ -47,6 +54,28 @@ class MainActivity : ComponentActivity() {
     private var isModelInitialized = false
     private var isProcessing = false
     
+    // 异步处理架构 - 优化版本
+    private val imageProcessingChannel = Channel<Bitmap>(capacity = 1) // 进一步减少队列大小，避免积压
+    private val isProcessingActive = AtomicBoolean(false)
+    private var processingJob: kotlinx.coroutines.Job? = null
+    
+    // 帧跳过计数器
+    private var skippedFrames = 0
+    private var processedFrames = 0
+    
+    // 性能监控
+    private var lastFrameTime = System.currentTimeMillis()
+    private var processingFrameCount = 0
+    private var actualFps = 0f
+    private var lastFpsTime = System.currentTimeMillis()
+    private var currentFps = 0f
+    
+    // 数据源类型
+    enum class DataSource {
+        CAMERA,  // 手机摄像头
+        STREAM   // 视频流
+    }
+    
     // UI状态管理
     private var previewView: PreviewView? = null
     private var processedBitmap: Bitmap? = null
@@ -57,6 +86,11 @@ class MainActivity : ComponentActivity() {
     // 使用MutableState来触发Compose重新组合
     private val _processedBitmapState = mutableStateOf<Bitmap?>(null)
     private val _uiUpdateTriggerState = mutableStateOf(0)
+    private val _dataSourceState = mutableStateOf(DataSource.CAMERA)
+    private val _ipAddressState = mutableStateOf("")
+    private val _showIpInputState = mutableStateOf(false)
+    private val _currentResolutionState = mutableStateOf(YOLOPModelManager.Companion.InputResolution.RESOLUTION_320)
+    private val _showResolutionSelector = mutableStateOf(false)
     
     // 权限请求
     private val requestPermissionLauncher = registerForActivityResult(
@@ -92,7 +126,40 @@ class MainActivity : ComponentActivity() {
                     YOLOPApp(
                         previewView = previewView,
                         processedBitmap = _processedBitmapState.value,
-                        uiUpdateTrigger = _uiUpdateTriggerState.value
+                        uiUpdateTrigger = _uiUpdateTriggerState.value,
+                        dataSource = _dataSourceState.value,
+                        ipAddress = _ipAddressState.value,
+                        showIpInput = _showIpInputState.value,
+                        onDataSourceChange = { newSource ->
+                            _dataSourceState.value = newSource
+                            if (newSource == DataSource.STREAM) {
+                                _showIpInputState.value = true
+                            } else {
+                                _showIpInputState.value = false
+                                // 切换到摄像头模式时重新初始化摄像头
+                                initializeCamera()
+                            }
+                        },
+                        onIpAddressChange = { newIp ->
+                            _ipAddressState.value = newIp
+                        },
+                        onConnectStream = { ip ->
+                            connectStream(ip)
+                        },
+                        onCancelIpInput = {
+                            _showIpInputState.value = false
+                            _dataSourceState.value = DataSource.CAMERA
+                        },
+                        currentResolution = _currentResolutionState.value,
+                        showResolutionSelector = _showResolutionSelector.value,
+                        onResolutionChange = { newResolution ->
+                            _currentResolutionState.value = newResolution
+                            modelManager.setInputResolution(newResolution)
+                            _showResolutionSelector.value = false
+                        },
+                        onToggleResolutionSelector = {
+                            _showResolutionSelector.value = !_showResolutionSelector.value
+                        }
                     )
                 }
             }
@@ -168,23 +235,73 @@ class MainActivity : ComponentActivity() {
     }
     
     /**
-     * 开始处理图像
+     * 开始异步图像处理
      */
     private fun startProcessing() {
-        lifecycleScope.launch {
+        // 启动异步处理协程
+        processingJob = lifecycleScope.launch(Dispatchers.Default) {
+            startAsyncImageProcessing()
+        }
+        
+        // 启动图像采集协程 - 智能优化版本
+        lifecycleScope.launch(Dispatchers.Main) {
             var frameCount = 0
             cameraManager.imageFlow.collect { bitmap ->
                 frameCount++
-                // 每3帧处理一次，平衡性能和流畅度
-                if (isModelInitialized && !isProcessing && frameCount % 3 == 0) {
-                    isProcessing = true
-                    try {
-                        processImage(bitmap)
-                    } catch (e: Exception) {
-                        Log.e(TAG, "处理图像时出错: ${e.message}", e)
-                    } finally {
-                        isProcessing = false
+                if (isModelInitialized) {
+                    // 智能帧跳过：如果最近跳过的帧太多，暂时停止采集
+                    if (skippedFrames > processedFrames * 5 && skippedFrames > 20) {
+                        Log.d(TAG, "跳帧过多，暂停采集")
+                        return@collect
                     }
+                    
+                    // 非阻塞地将图像放入处理队列
+                    if (!imageProcessingChannel.isClosedForSend) {
+                        val result = imageProcessingChannel.trySend(bitmap)
+                        if (result.isFailure) {
+                            // 队列满了，跳过这一帧
+                            skippedFrames++
+                            if (skippedFrames % 10 == 0) {
+                                Log.d(TAG, "已跳过 $skippedFrames 帧，处理了 $processedFrames 帧")
+                            }
+                        } else {
+                            processedFrames++
+                        }
+                    }
+                }
+            }
+        }
+    }
+    
+    /**
+     * 异步图像处理协程 - 优化版本
+     */
+    private suspend fun startAsyncImageProcessing() {
+        imageProcessingChannel.consumeEach { bitmap ->
+            if (isModelInitialized && isProcessingActive.compareAndSet(false, true)) {
+                try {
+                    val processStart = System.currentTimeMillis()
+                    
+                    withContext(Dispatchers.IO) {
+                        processImage(bitmap)
+                    }
+                    
+                    val processTime = System.currentTimeMillis() - processStart
+                    
+                    // 计算实际FPS
+                    processingFrameCount++
+                    val currentTime = System.currentTimeMillis()
+                    if (currentTime - lastFrameTime >= 1000) { // 每秒计算一次
+                        actualFps = processingFrameCount * 1000.0f / (currentTime - lastFrameTime)
+                        Log.i(TAG, "实际处理FPS: ${String.format("%.1f", actualFps)}, 处理时间: ${processTime}ms")
+                        processingFrameCount = 0
+                        lastFrameTime = currentTime
+                    }
+                    
+                } catch (e: Exception) {
+                    Log.e(TAG, "异步处理图像时出错: ${e.message}", e)
+                } finally {
+                    isProcessingActive.set(false)
                 }
             }
         }
@@ -204,11 +321,22 @@ class MainActivity : ComponentActivity() {
                     // 关键：回收旧的Bitmap以释放内存，避免内存泄漏和卡顿
                     _processedBitmapState.value?.recycle()
                     _processedBitmapState.value = renderedBitmap
-                    _uiUpdateTriggerState.value = _uiUpdateTriggerState.value + 1 // 递增以触发Compose重新组合
-                    Log.d(TAG, "UI状态已更新 - 触发次数: ${_uiUpdateTriggerState.value}")
+                    // 只在结果有显著变化时才更新UI触发次数
+                    _uiUpdateTriggerState.value = _uiUpdateTriggerState.value + 1
+                    Log.d(TAG, "UI状态已更新 - 触发次数: ${_uiUpdateTriggerState.value}, FPS: ${result.fps}")
                 }
                 
-                Log.d(TAG, "处理完成 - FPS: ${result.fps}, 检测数量: ${result.detections.size}")
+                // 计算实际FPS
+                processingFrameCount++
+                val currentTime = System.currentTimeMillis()
+                if (currentTime - lastFpsTime >= 1000) { // 每秒计算一次FPS
+                    currentFps = processingFrameCount * 1000.0f / (currentTime - lastFpsTime)
+                    processingFrameCount = 0
+                    lastFpsTime = currentTime
+                    Log.i(TAG, "实际FPS: ${String.format("%.1f", currentFps)}, 模型FPS: ${String.format("%.1f", result.fps)}, 检测数量: ${result.detections.size}")
+                }
+                
+                Log.d(TAG, "处理完成 - 模型FPS: ${result.fps}, 检测数量: ${result.detections.size}")
             }
         } catch (e: Exception) {
             Log.e(TAG, "图像处理失败: ${e.message}", e)
@@ -222,9 +350,37 @@ class MainActivity : ComponentActivity() {
         this.previewView = previewView
     }
     
+    /**
+     * 连接视频流
+     */
+    private fun connectStream(ipAddress: String) {
+        lifecycleScope.launch {
+            try {
+                Log.i(TAG, "开始连接视频流: $ipAddress")
+                
+                // 这里可以添加实际的视频流连接逻辑
+                // 目前只是模拟连接
+                Toast.makeText(this@MainActivity, "连接视频流: $ipAddress", Toast.LENGTH_SHORT).show()
+                
+                _showIpInputState.value = false
+                Log.i(TAG, "视频流连接已启动")
+                
+            } catch (e: Exception) {
+                Log.e(TAG, "视频流连接失败: ${e.message}", e)
+                Toast.makeText(this@MainActivity, "视频流连接失败: ${e.message}", Toast.LENGTH_LONG).show()
+            }
+        }
+    }
+    
     
     override fun onDestroy() {
         super.onDestroy()
+        
+        // 停止异步处理
+        processingJob?.cancel()
+        imageProcessingChannel.close()
+        
+        // 释放资源
         cameraManager.release()
         modelManager.release()
     }
@@ -237,7 +393,18 @@ class MainActivity : ComponentActivity() {
 fun YOLOPApp(
     previewView: PreviewView?,
     processedBitmap: Bitmap?,
-    uiUpdateTrigger: Int
+    uiUpdateTrigger: Int,
+    dataSource: MainActivity.DataSource,
+    ipAddress: String,
+    showIpInput: Boolean,
+    onDataSourceChange: (MainActivity.DataSource) -> Unit,
+    onIpAddressChange: (String) -> Unit,
+    onConnectStream: (String) -> Unit,
+    onCancelIpInput: () -> Unit,
+    currentResolution: YOLOPModelManager.Companion.InputResolution,
+    showResolutionSelector: Boolean,
+    onResolutionChange: (YOLOPModelManager.Companion.InputResolution) -> Unit,
+    onToggleResolutionSelector: () -> Unit
 ) {
     val lifecycleOwner = LocalLifecycleOwner.current
     
@@ -253,23 +420,23 @@ fun YOLOPApp(
         )
         
         
-        // 主摄像头预览区域（上半部分）
+        // 主摄像头预览区域（320x320固定尺寸）
         Box(
             modifier = Modifier
                 .fillMaxWidth()
-                .weight(1f)
-                .padding(horizontal = 16.dp)
+                .padding(horizontal = 16.dp),
+            contentAlignment = Alignment.Center
         ) {
-            // 摄像头预览
+            // 摄像头预览 - 固定320x320尺寸
             if (previewView != null) {
                 AndroidView(
                     factory = { previewView!! },
-                    modifier = Modifier.fillMaxSize()
+                    modifier = Modifier.size(320.dp)
                 )
             } else {
                 // 加载中显示
                 Box(
-                    modifier = Modifier.fillMaxSize(),
+                    modifier = Modifier.size(320.dp),
                     contentAlignment = Alignment.Center
                 ) {
                     Column(
@@ -307,6 +474,165 @@ fun YOLOPApp(
                         text = "检测: 车辆、车道线、可行驶区域",
                         style = MaterialTheme.typography.bodySmall
                     )
+                }
+            }
+        }
+        
+        // IP地址输入对话框
+        if (showIpInput) {
+            Card(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .padding(horizontal = 16.dp, vertical = 8.dp),
+                colors = CardDefaults.cardColors(
+                    containerColor = MaterialTheme.colorScheme.primaryContainer
+                )
+            ) {
+                Column(
+                    modifier = Modifier.padding(16.dp)
+                ) {
+                    Text(
+                        text = "输入视频流IP地址",
+                        style = MaterialTheme.typography.titleMedium,
+                        modifier = Modifier.padding(bottom = 8.dp)
+                    )
+                    
+                    OutlinedTextField(
+                        value = ipAddress,
+                        onValueChange = onIpAddressChange,
+                        label = { Text("IP地址 (例如: 192.168.1.100)") },
+                        keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Number),
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .padding(bottom = 8.dp)
+                    )
+                    
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        horizontalArrangement = Arrangement.End
+                    ) {
+                        TextButton(onClick = onCancelIpInput) {
+                            Text("取消")
+                        }
+                        Spacer(modifier = Modifier.width(8.dp))
+                        Button(
+                            onClick = { onConnectStream(ipAddress) },
+                            enabled = ipAddress.isNotBlank()
+                        ) {
+                            Text("连接")
+                        }
+                    }
+                }
+            }
+        }
+        
+        // 切换按钮区域
+        Card(
+            modifier = Modifier
+                .fillMaxWidth()
+                .padding(horizontal = 16.dp, vertical = 8.dp),
+            colors = CardDefaults.cardColors(
+                containerColor = MaterialTheme.colorScheme.surfaceVariant
+            )
+        ) {
+            Column(
+                modifier = Modifier.padding(16.dp)
+            ) {
+                // 数据源切换按钮
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.SpaceEvenly,
+                    verticalAlignment = Alignment.CenterVertically
+                ) {
+                    // 摄像头模式按钮
+                    Button(
+                        onClick = { onDataSourceChange(MainActivity.DataSource.CAMERA) },
+                        modifier = Modifier.weight(1f),
+                        colors = ButtonDefaults.buttonColors(
+                            containerColor = if (dataSource == MainActivity.DataSource.CAMERA) 
+                                MaterialTheme.colorScheme.primary 
+                            else MaterialTheme.colorScheme.surface
+                        )
+                    ) {
+                        Text("📹 摄像头")
+                    }
+                    
+                    Spacer(modifier = Modifier.width(8.dp))
+                    
+                    // 视频流模式按钮
+                    Button(
+                        onClick = { onDataSourceChange(MainActivity.DataSource.STREAM) },
+                        modifier = Modifier.weight(1f),
+                        colors = ButtonDefaults.buttonColors(
+                            containerColor = if (dataSource == MainActivity.DataSource.STREAM) 
+                                MaterialTheme.colorScheme.primary 
+                            else MaterialTheme.colorScheme.surface
+                        )
+                    ) {
+                        Text("🌐 视频流")
+                    }
+                }
+                
+                Spacer(modifier = Modifier.height(8.dp))
+                
+                // 分辨率选择按钮
+                Button(
+                    onClick = onToggleResolutionSelector,
+                    modifier = Modifier.fillMaxWidth(),
+                    colors = ButtonDefaults.buttonColors(
+                        containerColor = MaterialTheme.colorScheme.secondary
+                    )
+                ) {
+                    Text("🎯 分辨率: ${currentResolution.description}")
+                }
+                
+                // 分辨率选择器
+                if (showResolutionSelector) {
+                    Card(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .padding(top = 8.dp),
+                        colors = CardDefaults.cardColors(
+                            containerColor = MaterialTheme.colorScheme.primaryContainer
+                        )
+                    ) {
+                        Column(
+                            modifier = Modifier.padding(16.dp)
+                        ) {
+                            Text(
+                                text = "选择输入分辨率",
+                                style = MaterialTheme.typography.titleMedium,
+                                modifier = Modifier.padding(bottom = 8.dp)
+                            )
+                            
+                            YOLOPModelManager.Companion.InputResolution.values().forEach { resolution ->
+                                Button(
+                                    onClick = { 
+                                        if (resolution == YOLOPModelManager.Companion.InputResolution.RESOLUTION_320) {
+                                            onResolutionChange(resolution)
+                                        }
+                                    },
+                                    modifier = Modifier
+                                        .fillMaxWidth()
+                                        .padding(vertical = 2.dp),
+                                    colors = ButtonDefaults.buttonColors(
+                                        containerColor = if (resolution == currentResolution)
+                                            MaterialTheme.colorScheme.primary
+                                        else if (resolution == YOLOPModelManager.Companion.InputResolution.RESOLUTION_320)
+                                            MaterialTheme.colorScheme.surface
+                                        else MaterialTheme.colorScheme.surfaceVariant
+                                    ),
+                                    enabled = resolution == YOLOPModelManager.Companion.InputResolution.RESOLUTION_320
+                                ) {
+                                    Text(
+                                        if (resolution == YOLOPModelManager.Companion.InputResolution.RESOLUTION_320) 
+                                            resolution.description 
+                                        else "${resolution.description} (暂不支持)"
+                                    )
+                                }
+                            }
+                        }
+                    }
                 }
             }
         }

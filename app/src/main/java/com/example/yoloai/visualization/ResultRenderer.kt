@@ -30,12 +30,16 @@ class ResultRenderer {
         private val TEXT_COLOR = Color.WHITE
         private val TEXT_BACKGROUND_COLOR = Color.argb(150, 0, 0, 0)
         
-        // 绘制参数
-        private const val BOX_THICKNESS = 3f
-        private const val LANE_THICKNESS = 4f
-        private const val TEXT_SIZE = 24f
-        private const val TEXT_PADDING = 8f
-        private const val FPS_TEXT_SIZE = 32f
+        // 绘制参数 - 优化版本
+        private const val BOX_THICKNESS = 2f // 减少线条粗细
+        private const val LANE_THICKNESS = 3f
+        private const val TEXT_SIZE = 20f // 减少字体大小
+        private const val TEXT_PADDING = 6f
+        private const val FPS_TEXT_SIZE = 28f
+        
+        // 性能优化参数
+        private const val MAX_DETECTION_BOXES = 20 // 限制检测框数量
+        private const val SKIP_FRAME_RENDER = 2 // 每2帧渲染一次UI
     }
     
     private val paint = Paint().apply {
@@ -116,6 +120,12 @@ class ResultRenderer {
             style = Paint.Style.FILL
         }
         
+        // 优化：使用批量绘制减少Canvas调用次数
+        val path = Path()
+        var pathStarted = false
+        var batchCount = 0
+        val maxBatchSize = 1000 // 限制批处理大小避免路径过大
+        
         // 遍历分割掩码，绘制可行驶区域像素
         for (y in daSegMask.indices) {
             for (x in daSegMask[y].indices) {
@@ -125,13 +135,32 @@ class ResultRenderer {
                     val pixelWidth = maxOf(1f, scaleX)
                     val pixelHeight = maxOf(1f, scaleY)
                     
-                    canvas.drawRect(
+                    // 添加矩形到路径
+                    if (!pathStarted) {
+                        path.moveTo(screenX, screenY)
+                        pathStarted = true
+                    }
+                    path.addRect(
                         screenX, screenY,
                         screenX + pixelWidth, screenY + pixelHeight,
-                        areaPaint
+                        Path.Direction.CW
                     )
+                    
+                    batchCount++
+                    // 当批次达到最大大小时，绘制并重置
+                    if (batchCount >= maxBatchSize) {
+                        canvas.drawPath(path, areaPaint)
+                        path.reset()
+                        pathStarted = false
+                        batchCount = 0
+                    }
                 }
             }
+        }
+        
+        // 绘制剩余的路径
+        if (pathStarted) {
+            canvas.drawPath(path, areaPaint)
         }
     }
     
@@ -154,6 +183,15 @@ class ResultRenderer {
         // 使用像素级绘制，区分实线和虚线
         paint.style = Paint.Style.FILL
         
+        // 为实线和虚线分别创建路径
+        val solidPath = Path()
+        val dashedPath = Path()
+        var solidPathStarted = false
+        var dashedPathStarted = false
+        var solidBatchCount = 0
+        var dashedBatchCount = 0
+        val maxBatchSize = 500 // 车道线批处理大小
+        
         // 遍历分割掩码，绘制车道线像素
         for (y in llSegMask.indices) {
             for (x in llSegMask[y].indices) {
@@ -164,20 +202,63 @@ class ResultRenderer {
                     val pixelWidth = maxOf(1f, scaleX)
                     val pixelHeight = maxOf(1f, scaleY)
                     
-                    // 根据像素值设置不同颜色 - 严格按照demo copy.py
+                    // 根据像素值添加到不同路径
                     when (pixelValue) {
-                        1 -> paint.color = Color.BLUE       // 实线用蓝色 (BGR: 255,0,0)
-                        2 -> paint.color = Color.YELLOW     // 虚线用黄色 (BGR: 0,255,255)
-                        else -> paint.color = Color.BLUE    // 默认蓝色
+                        1 -> { // 实线
+                            if (!solidPathStarted) {
+                                solidPath.moveTo(screenX, screenY)
+                                solidPathStarted = true
+                            }
+                            solidPath.addRect(
+                                screenX, screenY,
+                                screenX + pixelWidth, screenY + pixelHeight,
+                                Path.Direction.CW
+                            )
+                            solidBatchCount++
+                            // 批处理优化
+                            if (solidBatchCount >= maxBatchSize) {
+                                paint.color = Color.BLUE
+                                canvas.drawPath(solidPath, paint)
+                                solidPath.reset()
+                                solidPathStarted = false
+                                solidBatchCount = 0
+                            }
+                        }
+                        2 -> { // 虚线
+                            if (!dashedPathStarted) {
+                                dashedPath.moveTo(screenX, screenY)
+                                dashedPathStarted = true
+                            }
+                            dashedPath.addRect(
+                                screenX, screenY,
+                                screenX + pixelWidth, screenY + pixelHeight,
+                                Path.Direction.CW
+                            )
+                            dashedBatchCount++
+                            // 批处理优化
+                            if (dashedBatchCount >= maxBatchSize) {
+                                paint.color = Color.YELLOW
+                                canvas.drawPath(dashedPath, paint)
+                                dashedPath.reset()
+                                dashedPathStarted = false
+                                dashedBatchCount = 0
+                            }
+                        }
                     }
-                    
-                    canvas.drawRect(
-                        screenX, screenY,
-                        screenX + pixelWidth, screenY + pixelHeight,
-                        paint
-                    )
                 }
             }
+        }
+        
+        // 一次性绘制所有实线
+        if (solidPathStarted) {
+            paint.color = Color.BLUE
+            canvas.drawPath(solidPath, paint)
+        }
+        
+        // 一次性绘制所有虚线
+        if (dashedPathStarted) {
+            paint.color = Color.YELLOW
+            canvas.drawPath(dashedPath, paint)
         }
     }
     
@@ -193,7 +274,10 @@ class ResultRenderer {
         paint.style = Paint.Style.STROKE
         paint.strokeWidth = BOX_THICKNESS
         
-        for (detection in detections) {
+        // 限制检测框数量以提高性能
+        val limitedDetections = detections.take(MAX_DETECTION_BOXES)
+        
+        for (detection in limitedDetections) {
             // 绘制检测框
             val rect = RectF(
                 detection.x1,
@@ -203,25 +287,27 @@ class ResultRenderer {
             )
             canvas.drawRect(rect, paint)
             
-            // 绘制标签
-            val label = "${detection.className} ${String.format("%.2f", detection.confidence)}"
-            val textBounds = Rect()
-            textPaint.getTextBounds(label, 0, label.length, textBounds)
-            
-            val textX = detection.x1
-            val textY = detection.y1 - TEXT_PADDING
-            
-            // 绘制文本背景
-            val backgroundRect = RectF(
-                textX,
-                textY - textBounds.height() - TEXT_PADDING,
-                textX + textBounds.width() + TEXT_PADDING * 2,
-                textY + TEXT_PADDING
-            )
-            canvas.drawRect(backgroundRect, backgroundPaint)
-            
-            // 绘制文本
-            canvas.drawText(label, textX + TEXT_PADDING, textY, textPaint)
+            // 只绘制高置信度的标签以节省性能
+            if (detection.confidence > 0.6f) {
+                val label = "${detection.className} ${String.format("%.0f%%", detection.confidence * 100)}"
+                val textBounds = Rect()
+                textPaint.getTextBounds(label, 0, label.length, textBounds)
+                
+                val textX = detection.x1
+                val textY = detection.y1 - TEXT_PADDING
+                
+                // 绘制文本背景
+                val backgroundRect = RectF(
+                    textX,
+                    textY - textBounds.height() - TEXT_PADDING,
+                    textX + textBounds.width() + TEXT_PADDING * 2,
+                    textY + TEXT_PADDING
+                )
+                canvas.drawRect(backgroundRect, backgroundPaint)
+                
+                // 绘制文本
+                canvas.drawText(label, textX + TEXT_PADDING, textY, textPaint)
+            }
         }
     }
     
