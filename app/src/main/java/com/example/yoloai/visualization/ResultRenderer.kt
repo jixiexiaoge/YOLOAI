@@ -1,0 +1,276 @@
+package com.example.yoloai.visualization
+
+import android.graphics.*
+import android.util.Log
+import com.example.yoloai.onnx.Detection
+import com.example.yoloai.onnx.YOLOPResult
+import kotlin.math.max
+import kotlin.math.min
+
+/**
+ * 结果渲染器
+ * 负责在图像上绘制检测和分割结果
+ * 
+ * 主要功能：
+ * 1. 绘制车辆检测框
+ * 2. 绘制车道线（实线/虚线）
+ * 3. 绘制可行驶区域
+ * 4. 显示FPS信息
+ */
+class ResultRenderer {
+    
+    companion object {
+        private const val TAG = "ResultRenderer"
+        
+        // 颜色定义 - 按照demo.py的效果
+        private val VEHICLE_COLOR = Color.MAGENTA      // 车辆框用紫色 (BGR: 255,0,255)
+        private val SOLID_LANE_COLOR = Color.RED       // 实线用红色 (BGR: 0,0,255)
+        private val DASHED_LANE_COLOR = Color.YELLOW   // 虚线用黄色 (BGR: 0,255,255)
+        private val DRIVABLE_AREA_COLOR = Color.GREEN  // 可行驶区域用绿色 (BGR: 0,255,0)
+        private val TEXT_COLOR = Color.WHITE
+        private val TEXT_BACKGROUND_COLOR = Color.argb(150, 0, 0, 0)
+        
+        // 绘制参数
+        private const val BOX_THICKNESS = 3f
+        private const val LANE_THICKNESS = 4f
+        private const val TEXT_SIZE = 24f
+        private const val TEXT_PADDING = 8f
+        private const val FPS_TEXT_SIZE = 32f
+    }
+    
+    private val paint = Paint().apply {
+        isAntiAlias = true
+        style = Paint.Style.STROKE
+        strokeWidth = BOX_THICKNESS
+    }
+    
+    private val textPaint = Paint().apply {
+        isAntiAlias = true
+        color = TEXT_COLOR
+        textSize = TEXT_SIZE
+        typeface = Typeface.DEFAULT_BOLD
+    }
+    
+    private val fpsPaint = Paint().apply {
+        isAntiAlias = true
+        color = TEXT_COLOR
+        textSize = FPS_TEXT_SIZE
+        typeface = Typeface.DEFAULT_BOLD
+    }
+    
+    private val backgroundPaint = Paint().apply {
+        color = TEXT_BACKGROUND_COLOR
+        style = Paint.Style.FILL
+    }
+    
+    /**
+     * 在图像上绘制检测结果
+     * @param bitmap 原始图像
+     * @param result YOLOP推理结果
+     * @return 绘制后的图像
+     */
+    fun renderResults(bitmap: Bitmap, result: YOLOPResult): Bitmap {
+        return try {
+            val outputBitmap = bitmap.copy(Bitmap.Config.ARGB_8888, true)
+            val canvas = Canvas(outputBitmap)
+            
+            // 1. 绘制可行驶区域（底层）
+            renderDrivableArea(canvas, result.daSegMask, bitmap.width, bitmap.height)
+            
+            // 2. 绘制车道线（中层）
+            renderLaneLines(canvas, result.llSegMask, bitmap.width, bitmap.height)
+            
+            // 3. 绘制车辆检测框（顶层）
+            renderDetections(canvas, result.detections)
+            
+            // 4. 绘制FPS信息（最顶层）
+            renderFPSInfo(canvas, result.fps, result.inferenceTime)
+            
+            outputBitmap
+            
+        } catch (e: Exception) {
+            Log.e(TAG, "渲染结果失败: ${e.message}", e)
+            bitmap
+        }
+    }
+    
+    /**
+     * 绘制可行驶区域 - 使用像素级渲染（仿照Python代码）
+     */
+    private fun renderDrivableArea(
+        canvas: Canvas,
+        daSegMask: Array<IntArray>?,
+        width: Int,
+        height: Int
+    ) {
+        if (daSegMask == null) return
+        
+        // 将320x320的分割掩码缩放到实际图像尺寸
+        val scaleX = width.toFloat() / daSegMask[0].size
+        val scaleY = height.toFloat() / daSegMask.size
+        
+        // 使用像素级绘制，仿照Python的show_seg_result函数
+        val areaPaint = Paint().apply {
+            color = Color.GREEN // 可行驶区域用绿色，仿照Python代码
+            alpha = 128 // 半透明效果
+            style = Paint.Style.FILL
+        }
+        
+        // 遍历分割掩码，绘制可行驶区域像素
+        for (y in daSegMask.indices) {
+            for (x in daSegMask[y].indices) {
+                if (daSegMask[y][x] == 1) { // 可行驶区域像素
+                    val screenX = x * scaleX
+                    val screenY = y * scaleY
+                    val pixelWidth = maxOf(1f, scaleX)
+                    val pixelHeight = maxOf(1f, scaleY)
+                    
+                    canvas.drawRect(
+                        screenX, screenY,
+                        screenX + pixelWidth, screenY + pixelHeight,
+                        areaPaint
+                    )
+                }
+            }
+        }
+    }
+    
+    
+    /**
+     * 绘制车道线 - 区分实线和虚线，使用不同颜色
+     */
+    private fun renderLaneLines(
+        canvas: Canvas,
+        llSegMask: Array<IntArray>?,
+        width: Int,
+        height: Int
+    ) {
+        if (llSegMask == null) return
+        
+        // 将320x320的分割掩码缩放到实际图像尺寸
+        val scaleX = width.toFloat() / llSegMask[0].size
+        val scaleY = height.toFloat() / llSegMask.size
+        
+        // 使用像素级绘制，区分实线和虚线
+        paint.style = Paint.Style.FILL
+        
+        // 遍历分割掩码，绘制车道线像素
+        for (y in llSegMask.indices) {
+            for (x in llSegMask[y].indices) {
+                val pixelValue = llSegMask[y][x]
+                if (pixelValue > 0) { // 车道线像素
+                    val screenX = x * scaleX
+                    val screenY = y * scaleY
+                    val pixelWidth = maxOf(1f, scaleX)
+                    val pixelHeight = maxOf(1f, scaleY)
+                    
+                    // 根据像素值设置不同颜色
+                    when (pixelValue) {
+                        1 -> paint.color = Color.RED        // 实线用红色
+                        2 -> paint.color = Color.CYAN       // 虚线用淡蓝色
+                        else -> paint.color = Color.RED     // 默认红色
+                    }
+                    
+                    canvas.drawRect(
+                        screenX, screenY,
+                        screenX + pixelWidth, screenY + pixelHeight,
+                        paint
+                    )
+                }
+            }
+        }
+    }
+    
+    
+    
+    
+    
+    /**
+     * 绘制检测框 - 使用紫色框标记车辆
+     */
+    private fun renderDetections(canvas: Canvas, detections: List<Detection>) {
+        paint.color = VEHICLE_COLOR
+        paint.style = Paint.Style.STROKE
+        paint.strokeWidth = BOX_THICKNESS
+        
+        for (detection in detections) {
+            // 绘制检测框
+            val rect = RectF(
+                detection.x1,
+                detection.y1,
+                detection.x2,
+                detection.y2
+            )
+            canvas.drawRect(rect, paint)
+            
+            // 绘制标签
+            val label = "${detection.className} ${String.format("%.2f", detection.confidence)}"
+            val textBounds = Rect()
+            textPaint.getTextBounds(label, 0, label.length, textBounds)
+            
+            val textX = detection.x1
+            val textY = detection.y1 - TEXT_PADDING
+            
+            // 绘制文本背景
+            val backgroundRect = RectF(
+                textX,
+                textY - textBounds.height() - TEXT_PADDING,
+                textX + textBounds.width() + TEXT_PADDING * 2,
+                textY + TEXT_PADDING
+            )
+            canvas.drawRect(backgroundRect, backgroundPaint)
+            
+            // 绘制文本
+            canvas.drawText(label, textX + TEXT_PADDING, textY, textPaint)
+        }
+    }
+    
+    /**
+     * 绘制FPS信息和图例
+     */
+    private fun renderFPSInfo(canvas: Canvas, fps: Float, inferenceTime: Long) {
+        val fpsText = "FPS: ${String.format("%.1f", fps)}"
+        val timeText = "Time: ${inferenceTime}ms"
+        
+        val x = 20f
+        var y = 30f
+        
+        // 绘制图例
+        val legendPaint = Paint().apply {
+            isAntiAlias = true
+            color = TEXT_COLOR
+            textSize = 24f
+            typeface = Typeface.DEFAULT_BOLD
+        }
+        
+        // 图例背景
+        val legendBackground = RectF(
+            x - 10f,
+            y - 20f,
+            x + 300f,
+            y + 125f
+        )
+        canvas.drawRect(legendBackground, backgroundPaint)
+        
+        // 绘制图例文字
+        canvas.drawText("Red: Solid Lines", x, y, legendPaint)
+        y += 25f
+        canvas.drawText("Cyan: Dashed Lines", x, y, legendPaint)
+        y += 25f
+        canvas.drawText("Green: Drivable Area", x, y, legendPaint)
+        y += 25f
+        canvas.drawText("Purple: Vehicle", x, y, legendPaint)
+        
+        // 绘制FPS信息
+        y += 40f
+        canvas.drawText(fpsText, x, y, fpsPaint)
+        y += 30f
+        canvas.drawText(timeText, x, y, fpsPaint)
+    }
+}
+
+/**
+ * 点数据类
+ */
+data class Point(val x: Int, val y: Int)
+
